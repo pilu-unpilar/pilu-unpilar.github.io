@@ -575,10 +575,10 @@ function say(t,keep){
   if(!window.speechSynthesis){status(t);return}
   t.split(/\n+/).forEach(function(part){part=part.trim();if(!part)return;
     var u=new SpeechSynthesisUtterance(part);u.lang="es-AR";u.rate=V.rate;var v=vozES();if(v)u.voice=v;
-    u.onstart=function(){V.speaking=true;status("PilU está hablando…")};
+    u.onstart=function(){V.speaking=true;V.cur=norm(part);status("PilU está hablando… Decí «Hola PilU» o tocá la pantalla para cortar")};
     u.onend=u.onerror=function(){setTimeout(function(){if(!speechSynthesis.speaking){V.speaking=false;V.ignoreUntil=Date.now()+400;status(V.awake?"Te escucho…":(V.listen?"Decí «Hola PilU» para hablarme":""));wakeTimer()}},50)};
     speechSynthesis.speak(u)})}
-function hush(){if(window.speechSynthesis)speechSynthesis.cancel();V.speaking=false}
+function hush(){if(window.speechSynthesis)speechSynthesis.cancel();V.speaking=false;V.cur="";V.ignoreUntil=0}
 function speechOf(el){
   var c=el.cloneNode(true);c.querySelectorAll(".src,.extra,.cal").forEach(function(x){x.remove()});
   c.querySelectorAll("dt").forEach(function(x){x.textContent=x.textContent+": "});c.querySelectorAll("dd").forEach(function(x){x.textContent=x.textContent+". "});
@@ -595,14 +595,23 @@ function leerOpciones(){
   if(b.length)t+=(t?" ":"")+"También: "+b.join(". ")+".";
   if(mode)t="Estoy esperando tu respuesta. Decila en voz alta. "+t;
   say(t||"Decí tu pregunta.")}
-var _opts=opts;opts=function(list){var b=_opts(list);if(V.on)setTimeout(function(){say("Opciones: "+list.map(function(x){return x.t}).join(". ")+".",true)},0);return b};
+var _opts=opts;opts=function(list){var b=_opts(list);if(V.on)setTimeout(function(){
+  if(list.length<=3)say("Podés elegir: "+list.map(function(x){return x.t}).join(", o ")+".",true);
+  else say("Tengo "+list.length+" temas. Decí lo que buscás, o decí «opciones» para escucharlos.",true)},0);return b};
 function wakeTimer(){clearTimeout(V.timer);if(V.awake)V.timer=setTimeout(function(){V.awake=false;if(V.on&&V.listen)status("Decí «Hola PilU» para hablarme")},25000)}
 var WAKE=/\b(h?ola)[\s,]+(p|b)i\s*l{1,2}\s*(u|o)\b/;
+/* ¿Lo que escuchó es la propia voz de PilU? (cuando PilU dice "Hola PilU" en sus instrucciones) */
+function eco(n,m){var cur=V.cur||"";if(!/hola pil/.test(cur))return false;
+  var rest=n.slice(m.index+m[0].length).split(" ").filter(function(w){return w.length>2});
+  return !rest.length||rest.every(function(w){return cur.indexOf(w)>-1})}
 function oir(raw){
   var n=norm(raw).replace(/[.,;:¡!¿?]/g," ").replace(/\s+/g," ").trim();if(!n)return;
   var stop=/^(silencio|callate|para|pare|basta|stop|chito)\b/.test(n);
-  if((V.speaking||Date.now()<V.ignoreUntil)&&!stop)return; /* no se escucha a sí misma */
   var m=n.match(WAKE);
+  if(V.speaking||Date.now()<V.ignoreUntil){
+    if(stop){hush();return}
+    /* "Hola PilU" interrumpe, salvo que sea el eco de la propia PilU diciéndolo */
+    if(m&&!eco(n,m)){hush()}else return}
   if(m){V.awake=true;var rest=n.slice(m.index+m[0].length).trim();
     if(rest){comando(rest,raw)}else{say(prof?"¡Hola! Te escucho.":"¡Hola! Te escucho. ¿Sos ingresante o estudiante?");}
     wakeTimer();return}
@@ -653,11 +662,13 @@ function toggle(){
   V.on=!V.on;chat.setAttribute("aria-live",V.on?"off":"polite");
   if(V.on){
     escuchar();rotulo();rateLabel();
-    say(V.listen||SR||DICT?"Modo voz activado. Voy a leer las respuestas en voz alta. Para hablarme, decí Hola PilU y lo que necesitás. Por ejemplo: Hola PilU, cómo me inscribo. Para escuchar las opciones, decí: Hola PilU, opciones.":
+    say(V.listen||SR||DICT?"Modo voz activado. Para hablarme, decí Hola PilU y tu pregunta. Por ejemplo: Hola PilU, cómo me inscribo. Para cortarme, decí Hola PilU o tocá la pantalla.":
       "Lectura en voz alta activada. Este navegador no permite comandos de voz, así que podés usar los botones o escribir.");
     status(V.listen?"Decí «Hola PilU» para hablarme":"")}
   else{V.awake=false;var l=V.listen;V.listen=null;hush();try{if(l==="native")REC.stop();if(l==="dict")DICT.stop()}catch(x){}rotulo();status("")}}
 vBtn.onclick=toggle;
+document.addEventListener("pointerdown",function(e){if(V.on&&V.speaking&&!e.target.closest("#v-repeat,#v-rate,#v-toggle"))hush()},true);
+document.addEventListener("keydown",function(e){if(V.on&&V.speaking&&(e.key==="Enter"||e.key===" ")&&!(e.target.closest&&e.target.closest("#v-repeat,#v-rate,#v-toggle")))hush()},true);
 vRep.onclick=function(){hush();say(V.last,true)};
 vRate.onclick=function(){var i=RATES.findIndex(function(r){return Math.abs(r[0]-V.rate)<0.05});V.rate=RATES[(i+1)%RATES.length][0];rateLabel();hush();say("Velocidad "+RATES[(i+1)%RATES.length][1]+".",true)};
 document.addEventListener("keydown",function(e){if(e.key==="Escape"&&V.on)hush()});
