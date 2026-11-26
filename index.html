@@ -583,7 +583,8 @@ document.getElementById("f").onsubmit=function(e){e.preventDefault();var v=inp.v
 /* ---- Ajustes de tiempos y sensibilidad ---- */
 var CFG={
   LANG:"es-AR",
-  LISTEN_DELAY_MS:500,      // pausa entre el fin del habla y la apertura del micrófono. Subila (500-800) si el celular todavía se escucha a sí mismo.
+  LISTEN_DELAY_MS:500,
+  SPEAK_DELAY_MS:350,       // pausa entre cerrar el micrófono y empezar a hablar (Android necesita liberar el audio). Subila a 500-700 si la primera frase después de hablarle no se escucha.      // pausa entre el fin del habla y la apertura del micrófono. Subila (500-800) si el celular todavía se escucha a sí mismo.
   LISTEN_TIMEOUT_MS:9000,   // cuánto espera escuchando sin que nadie hable. Después avisa y pasa a pausa.
   STANDBY_MS:90000,         // cuánto sigue atento a «Hola PilU» en pausa. Después apaga el micrófono (un toque en la pantalla lo retoma).
   PROCESS_TIMEOUT_MS:1800,  // si una acción no tiene nada que decir, vuelve a escuchar pasado este tiempo.
@@ -603,11 +604,17 @@ var EN_MARCO=(function(){try{return window.self!==window.top}catch(e){return tru
 if(window.claude&&window.claude.use){window.claude.use("dictation").then(function(d){DICT=d}).catch(function(){})}
 var WAKE=/\b(h?ola)[\s,]+(p|b)i\s*l{1,2}\s*(u|o)\b/;
 
+var DBG=/debug/.test(location.hash),dbgLines=[];
+function dbg(m){if(!DBG)return;var el=document.getElementById("v-debug");
+  if(!el){el=document.createElement("pre");el.id="v-debug";el.style.cssText="position:fixed;left:0;right:0;bottom:0;z-index:70;margin:0;max-height:34vh;overflow:auto;background:#000;color:#9f9;font:11px/1.35 monospace;padding:6px 8px;white-space:pre-wrap";document.body.appendChild(el)}
+  var d=new Date();dbgLines.push(("0"+d.getMinutes()).slice(-2)+":"+("0"+d.getSeconds()).slice(-2)+"."+("00"+d.getMilliseconds()).slice(-3)+" "+m);
+  dbgLines=dbgLines.slice(-40);el.textContent=dbgLines.join("\n");el.scrollTop=el.scrollHeight}
 function T(name,fn,ms){clearTimeout(V.timers[name]);V.timers[name]=fn?setTimeout(fn,ms):null}
 function status(t){vStat.hidden=!t;vStat.textContent=t||""}
 
 /* ---- Estado: una sola función cambia de estado y actualiza la interfaz ---- */
 function setState(s,info){
+  if(V.state!==s)dbg("estado → "+s);
   V.state=s;
   document.documentElement.setAttribute("data-voz",V.on?s.toLowerCase():"off");
   botonStop(s===ST.SPEAKING);
@@ -657,17 +664,33 @@ function hablarSiguiente(){
   if(!V.queue.length){finHabla();return}
   if(!window.speechSynthesis){status(V.queue.join(" "));V.queue=[];finHabla();return}
   stopRec();T("lt");T("pt");                       // nunca escuchar mientras habla
+  var primera=V.state!==ST.SPEAKING;
   setState(ST.SPEAKING);
-  var f=V.queue.shift(),u=new SpeechSynthesisUtterance(f),done=false;
+  /* Al pasar de escuchar a hablar se espera un instante: Android necesita liberar el audio del micrófono.
+     Si se habla enseguida, la frase se pierde sin aviso (escucha bien pero después "no habla"). */
+  var espera=primera?Math.max(30,CFG.SPEAK_DELAY_MS-(Date.now()-(V.micClosedAt||0))):0;
+  if(espera>30){T("utt");T("tts0",function(){decir(g,0)},espera)}else decir(g,0)}
+function decir(g,intento){
+  if(g!==V.gen)return;
+  if(!V.queue.length){finHabla();return}
+  var f=V.queue[0],u=new SpeechSynthesisUtterance(f),done=false,arranco=false;
+  V.u=u;                                            // se guarda la referencia: si no, Chrome a veces descarta la frase y nunca avisa que terminó
   u.lang=CFG.LANG;u.rate=V.rate;var vz=vozES();if(vz)u.voice=vz;
-  function next(){if(done||g!==V.gen)return;done=true;T("utt");hablarSiguiente()}
-  u.onstart=function(){if(g===V.gen&&!vStart.hidden)ocultarInicio()};
-  u.onend=next;
-  u.onerror=function(e){if(g!==V.gen)return;
-    if(e&&e.error==="not-allowed"){V.queue=[];done=true;T("utt");setState(ST.IDLE);mostrarInicio();return} // el navegador pide un toque antes de hablar
-    next()};
+  function next(){if(done||g!==V.gen)return;done=true;T("utt");T("tts1");V.queue.shift();hablarSiguiente()}
+  function reintentar(motivo){if(done||g!==V.gen)return;done=true;T("utt");T("tts1");dbg("voz: falla ("+motivo+"), intento "+(intento+1));
+    if(intento<2){try{speechSynthesis.cancel()}catch(e){}T("tts0",function(){decir(g,intento+1)},350)}
+    else{V.queue.shift();hablarSiguiente()}}
+  u.onstart=function(){if(g!==V.gen)return;arranco=true;T("tts1");dbg("voz: habla «"+f.slice(0,30)+"»");if(!vStart.hidden)ocultarInicio()};
+  u.onend=function(){if(!arranco&&g===V.gen&&!done){reintentar("terminó sin hablar");return}next()};
+  u.onerror=function(e){if(g!==V.gen||done)return;var er=e&&e.error;
+    if(er==="not-allowed"){V.queue=[];done=true;T("utt");T("tts1");setState(ST.IDLE);mostrarInicio();return} // el navegador pide un toque antes de hablar
+    if(arranco&&(er==="interrupted"||er==="canceled")){next();return}
+    reintentar(er||"error")};
+  /* Si en 1,5 s la frase ni empezó, la voz del navegador quedó trabada: se destraba y se reintenta */
+  T("tts1",function(){if(!arranco)reintentar("no arrancó")},1500);
   /* Seguro: algunos Android nunca avisan el final de una frase. Si pasa este tiempo, sigue igual. */
-  T("utt",next,Math.max(2500,f.length*90/V.rate+1500));
+  T("utt",next,Math.max(4000,f.length*90/V.rate+2500));
+  try{speechSynthesis.resume()}catch(e){}
   speechSynthesis.speak(u)}
 function finHabla(){
   var a=V.after;V.after="listen";
@@ -678,7 +701,7 @@ function finHabla(){
   setState(ST.LISTENING,"Abriendo el micrófono…");
   T("listen",startListening,CFG.LISTEN_DELAY_MS)}
 /* Corta la voz al instante. Las frases pendientes se descartan (gen invalida los avisos viejos). */
-function callar(){V.gen++;V.queue=[];T("utt");T("listen");if(window.speechSynthesis)speechSynthesis.cancel()}
+function callar(){V.gen++;V.queue=[];T("utt");T("tts0");T("tts1");T("listen");if(window.speechSynthesis)speechSynthesis.cancel()}
 
 /* ---- LISTENING: un turno de escucha por vez ---- */
 function puedeEscuchar(){return (SR&&!V.blocked&&!(EN_MARCO&&V.dictOn))||V.dictOn}
@@ -686,13 +709,13 @@ function puedeEscuchar(){return (SR&&!V.blocked&&!(EN_MARCO&&V.dictOn))||V.dictO
    (escucha la primera vez y después no vuelve a abrir el micrófono). */
 function nuevoRec(){
   var r=new SR();r.lang=CFG.LANG;r.continuous=false;r.interimResults=true;r.maxAlternatives=1;
-  r.onstart=function(){if(r!==REC)return;V.recOn=true;V.fallos=0;if(V.state===ST.LISTENING)setState(ST.LISTENING)};
+  r.onstart=function(){if(r!==REC)return;dbg("mic: abierto");V.recOn=true;V.fallos=0;if(V.state===ST.LISTENING)setState(ST.LISTENING)};
   r.onresult=function(e){if(r!==REC)return;var txt="",fin=false,conf=1;
     for(var i=e.resultIndex;i<e.results.length;i++){var x=e.results[i];txt+=x[0].transcript;if(x.isFinal){fin=true;conf=x[0].confidence}}
     if(!fin){if(V.state===ST.LISTENING)setState(ST.LISTENING,"Escuchando: "+txt);return}
     if(conf&&conf<CFG.MIN_CONFIDENCE)return;
-    V.heard=true;V.oyoAlgunaVez=true;recibido(txt)};
-  r.onerror=function(e){if(r!==REC)return;V.lastErr=e.error;
+    dbg("mic: entendió «"+txt+"»");V.heard=true;V.oyoAlgunaVez=true;recibido(txt)};
+  r.onerror=function(e){if(r!==REC)return;V.lastErr=e.error;dbg("mic: error "+e.error);
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){
       /* Con permiso ya dado, este error significa que el navegador pide un toque para abrir el micrófono (pasa en iPhone) */
       if(V.permiso==="granted"||V.oyoAlgunaVez){pedirToque()}
@@ -714,7 +737,7 @@ function abrirMic(conToque){
   T("ws",function(){if(REC===r&&!V.recOn){stopRec();V.fallos=(V.fallos||0)+1;
     if(V.fallos<5&&(V.state===ST.LISTENING||V.standby||V.pre))abrirMic(conToque);else pedirToque()}},2000)}
 function stopRec(){T("re");T("ws");var r=REC;REC=null;V.recOn=false;
-  if(r){r.onresult=r.onstart=r.onerror=r.onend=null;try{r.abort()}catch(e){}}}
+  if(r){V.micClosedAt=Date.now();r.onresult=r.onstart=r.onerror=r.onend=null;try{r.abort()}catch(e){}}}
 /* El navegador no deja abrir el micrófono solo: se pide un toque en cualquier parte de la pantalla */
 function pedirToque(){var r=REC;REC=null;V.recOn=false;if(r){r.onresult=r.onstart=r.onerror=r.onend=null;try{r.abort()}catch(e){}}
   V.needTap=true;T("lt");
@@ -874,7 +897,7 @@ function mostrarInicio(){vStart.hidden=false;vSkip.hidden=false;setTimeout(funct
 vStart.onclick=function(){ocultarInicio();if(!V.on)activarSesion();else saludo()};
 vSkip.onclick=function(){ocultarInicio();V.pre=false;stopRec();try{localStorage.removeItem("pilu-voz")}catch(e){}};
 (function(){var quiere=false;try{quiere=localStorage.getItem("pilu-voz")==="1"}catch(e){}
-  if(location.hash==="#voz")quiere=true;
+  if(/^#voz/.test(location.hash))quiere=true;
   if(!quiere)return;
   mostrarInicio();
   if(SR&&!EN_MARCO&&navigator.permissions&&navigator.permissions.query)
