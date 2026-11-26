@@ -583,7 +583,7 @@ document.getElementById("f").onsubmit=function(e){e.preventDefault();var v=inp.v
 /* ---- Ajustes de tiempos y sensibilidad ---- */
 var CFG={
   LANG:"es-AR",
-  LISTEN_DELAY_MS:350,      // pausa entre el fin del habla y la apertura del micrófono. Subila (500-800) si el celular todavía se escucha a sí mismo.
+  LISTEN_DELAY_MS:500,      // pausa entre el fin del habla y la apertura del micrófono. Subila (500-800) si el celular todavía se escucha a sí mismo.
   LISTEN_TIMEOUT_MS:9000,   // cuánto espera escuchando sin que nadie hable. Después avisa y pasa a pausa.
   STANDBY_MS:90000,         // cuánto sigue atento a «Hola PilU» en pausa. Después apaga el micrófono (un toque en la pantalla lo retoma).
   PROCESS_TIMEOUT_MS:1800,  // si una acción no tiene nada que decir, vuelve a escuchar pasado este tiempo.
@@ -682,29 +682,53 @@ function callar(){V.gen++;V.queue=[];T("utt");T("listen");if(window.speechSynthe
 
 /* ---- LISTENING: un turno de escucha por vez ---- */
 function puedeEscuchar(){return (SR&&!V.blocked&&!(EN_MARCO&&V.dictOn))||V.dictOn}
-function crearRec(){
-  if(REC||!SR)return REC;
-  REC=new SR();REC.lang=CFG.LANG;REC.continuous=false;REC.interimResults=true;REC.maxAlternatives=1;
-  REC.onstart=function(){V.recOn=true};
-  REC.onresult=function(e){var txt="",fin=false,conf=1;
-    for(var i=e.resultIndex;i<e.results.length;i++){var r=e.results[i];txt+=r[0].transcript;if(r.isFinal){fin=true;conf=r[0].confidence}}
+/* Un reconocedor NUEVO por cada turno: reusar el mismo después de cortarlo lo deja trabado en varios celulares
+   (escucha la primera vez y después no vuelve a abrir el micrófono). */
+function nuevoRec(){
+  var r=new SR();r.lang=CFG.LANG;r.continuous=false;r.interimResults=true;r.maxAlternatives=1;
+  r.onstart=function(){if(r!==REC)return;V.recOn=true;V.fallos=0;if(V.state===ST.LISTENING)setState(ST.LISTENING)};
+  r.onresult=function(e){if(r!==REC)return;var txt="",fin=false,conf=1;
+    for(var i=e.resultIndex;i<e.results.length;i++){var x=e.results[i];txt+=x[0].transcript;if(x.isFinal){fin=true;conf=x[0].confidence}}
     if(!fin){if(V.state===ST.LISTENING)setState(ST.LISTENING,"Escuchando: "+txt);return}
     if(conf&&conf<CFG.MIN_CONFIDENCE)return;
-    V.heard=true;recibido(txt)};
-  REC.onerror=function(e){if(/not-allowed|service-not-allowed|audio-capture/.test(e.error)){V.blocked=true;V.recOn=false;if(V.on)sinMicrofono()}};
-  REC.onend=function(){V.recOn=false;if(V.blocked)return;
-    /* El turno terminó sin que se entienda nada: reabre el micrófono hasta agotar el tiempo de espera */
-    if(V.state===ST.LISTENING&&!V.heard){if(Date.now()<V.listenUntil)T("re",abrirMic,150);else silencio()}
-    else if(V.state===ST.IDLE&&((V.on&&V.standby&&Date.now()<V.standbyUntil)||(!V.on&&V.pre)))T("re",abrirMic,300)};
-  return REC}
-function abrirMic(){if(!SR||V.blocked||V.recOn)return;crearRec();V.heard=false;try{REC.start()}catch(e){}}
-function stopRec(){T("re");if(REC&&V.recOn){try{REC.abort()}catch(e){}}V.recOn=false}
-function startListening(){
+    V.heard=true;V.oyoAlgunaVez=true;recibido(txt)};
+  r.onerror=function(e){if(r!==REC)return;V.lastErr=e.error;
+    if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+      /* Con permiso ya dado, este error significa que el navegador pide un toque para abrir el micrófono (pasa en iPhone) */
+      if(V.permiso==="granted"||V.oyoAlgunaVez){pedirToque()}
+      else{V.blocked=true;V.recOn=false;if(V.on)sinMicrofono()}}};
+  r.onend=function(){if(r!==REC)return;V.recOn=false;REC=null;if(V.blocked||V.needTap)return;
+    /* Turno sin resultado ("no-speech", micrófono ocupado tras hablar, etc.): reintenta hasta agotar el tiempo de espera */
+    var espera=V.lastErr==="audio-capture"||V.lastErr==="network"?700:200;V.lastErr="";
+    if(V.state===ST.LISTENING&&!V.heard){if(Date.now()<V.listenUntil)T("re",function(){abrirMic()},espera);else silencio()}
+    else if(V.state===ST.IDLE&&((V.on&&V.standby&&Date.now()<V.standbyUntil)||(!V.on&&V.pre)))T("re",function(){abrirMic()},300)};
+  return r}
+function abrirMic(conToque){
+  if(!SR||V.blocked)return;
+  if(V.needTap&&!conToque){setState(V.state===ST.LISTENING?ST.IDLE:V.state);status("Tocá la pantalla para hablarme");return}
+  if(conToque)V.needTap=false;
+  stopRec();V.heard=false;
+  var r=REC=nuevoRec();
+  try{r.start()}catch(e){REC=null;V.fallos=(V.fallos||0)+1;if(V.fallos<5)T("re",function(){abrirMic(conToque)},400);return}
+  /* Si en 2 segundos el micrófono no arrancó, se descarta y se prueba con otro */
+  T("ws",function(){if(REC===r&&!V.recOn){stopRec();V.fallos=(V.fallos||0)+1;
+    if(V.fallos<5&&(V.state===ST.LISTENING||V.standby||V.pre))abrirMic(conToque);else pedirToque()}},2000)}
+function stopRec(){T("re");T("ws");var r=REC;REC=null;V.recOn=false;
+  if(r){r.onresult=r.onstart=r.onerror=r.onend=null;try{r.abort()}catch(e){}}}
+/* El navegador no deja abrir el micrófono solo: se pide un toque en cualquier parte de la pantalla */
+function pedirToque(){var r=REC;REC=null;V.recOn=false;if(r){r.onresult=r.onstart=r.onerror=r.onend=null;try{r.abort()}catch(e){}}
+  V.needTap=true;T("lt");
+  if(!V.on)return;
+  if(V.state===ST.LISTENING)setState(ST.IDLE);
+  status("Tocá la pantalla para hablarme");
+  if(!V.avisoToque){V.avisoToque=true;speak("Para hablarme, tocá la pantalla en cualquier lugar y después decí lo que necesitás.",{keep:true,full:true,after:"idle"})}}
+function startListening(conToque){
   if(!V.on)return;
   if(!puedeEscuchar()){setState(ST.IDLE);return}
   V.standby=false;V.heard=false;V.listenUntil=Date.now()+CFG.LISTEN_TIMEOUT_MS;
   setState(ST.LISTENING);
-  if(!(EN_MARCO&&V.dictOn))abrirMic();
+  if(V.needTap&&!conToque){setState(ST.IDLE);status("Tocá la pantalla para hablarme");return}
+  if(!(EN_MARCO&&V.dictOn))abrirMic(conToque);
   T("lt",function(){if(V.state===ST.LISTENING&&!V.heard){stopRec();silencio()}},CFG.LISTEN_TIMEOUT_MS+500)}
 function silencio(){if(!V.on||V.state!==ST.LISTENING)return;
   speak("Sigo acá. Decí Hola PilU o tocá la pantalla cuando me necesites.",{keep:true,full:true,after:"standby"})}
@@ -815,9 +839,9 @@ function botonStop(on){if(!vRep)return;vRep.classList.toggle("stop",on);vRep.inn
 function rotulo(){vBtn.setAttribute("aria-pressed",V.on?"true":"false");vBtn.classList.toggle("on",V.on);vLab.textContent=V.on?"Desactivar voz":"Activar voz";vRep.hidden=vRate.hidden=!V.on}
 function rateLabel(){var r=RATES.reduce(function(a,b){return Math.abs(b[0]-V.rate)<Math.abs(a[0]-V.rate)?b:a});vRate.textContent=r[0]+"×";vRate.setAttribute("aria-label","Velocidad de lectura: "+r[1]+". Tocá para cambiar")}
 vBtn.onclick=toggle;
-vRep.onclick=function(){if(V.state===ST.SPEAKING){callar();startListening();return}callar();speak(V.last,{keep:true,full:true})};
+vRep.onclick=function(){if(V.state===ST.SPEAKING){callar();startListening(true);return}callar();speak(V.last,{keep:true,full:true})};
 vRate.onclick=function(){var i=RATES.findIndex(function(r){return Math.abs(r[0]-V.rate)<0.05});V.rate=RATES[(i+1)%RATES.length][0];rateLabel();callar();speak("Velocidad "+RATES[(i+1)%RATES.length][1]+".",{keep:true})};
-vStat.onclick=function(){if(!V.on)return;if(V.state===ST.SPEAKING||V.state===ST.IDLE){callar();startListening()}};
+vStat.onclick=function(){if(!V.on)return;callar();startListening(true)};
 
 /* ---- Interrupción por gesto (tap-to-interrupt) ----
    · Toque en cualquier parte mientras habla: corta y pasa a escuchar.
@@ -829,14 +853,15 @@ function gesto(target){
   var interactivo=target.closest("button,a,input,label,select,textarea");
   if(interactivo)V.more=null;                       // eligió otra cosa: el «más detalle» anterior ya no aplica
   if(V.state===ST.SPEAKING){callar();
-    if(interactivo)procesando();else startListening();return}
+    if(interactivo)procesando();else startListening(true);return}
   if(V.state===ST.LISTENING&&interactivo){stopRec();T("lt");procesando();return}
-  if(V.state===ST.IDLE&&!interactivo){callar();startListening()}}
+  if(V.state===ST.LISTENING&&!interactivo&&!V.recOn){startListening(true);return}
+  if(V.state===ST.IDLE&&!interactivo){callar();startListening(true)}}
 function procesando(){setState(ST.PROCESSING);T("pt",function(){if(V.state===ST.PROCESSING)startListening()},CFG.PROCESS_TIMEOUT_MS)}
 document.addEventListener("pointerdown",function(e){gesto(e.target)},true);
 document.addEventListener("keydown",function(e){
   if(!V.on)return;
-  if(e.key==="Escape"&&V.state===ST.SPEAKING){callar();startListening();return}
+  if(e.key==="Escape"&&V.state===ST.SPEAKING){callar();startListening(true);return}
   if(e.key==="Enter"||e.key===" ")gesto(document.activeElement)},true);
 document.getElementById("f").addEventListener("submit",function(){if(V.on&&V.state!==ST.SPEAKING){stopRec();T("lt");procesando()}},true);
 
@@ -854,6 +879,7 @@ vSkip.onclick=function(){ocultarInicio();V.pre=false;stopRec();try{localStorage.
   mostrarInicio();
   if(SR&&!EN_MARCO&&navigator.permissions&&navigator.permissions.query)
     navigator.permissions.query({name:"microphone"}).then(function(p){if(p.state==="granted"&&!V.on){V.pre=true;abrirMic()}}).catch(function(){})})();
+try{navigator.permissions.query({name:"microphone"}).then(function(p){V.permiso=p.state;p.onchange=function(){V.permiso=p.state}}).catch(function(){})}catch(e){}
 if(window.speechSynthesis&&speechSynthesis.onvoiceschanged!==undefined)speechSynthesis.onvoiceschanged=function(){};
 setState(ST.IDLE);
 /* Tamaño de letra y alto contraste (se recuerdan en este dispositivo) */
